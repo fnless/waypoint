@@ -32,6 +32,17 @@ namespace Tcp {
 namespace MetadataExchange {
 namespace {
 
+constexpr std::string_view kMetadataPrefix = "wasm.";
+constexpr std::string_view kUpstreamMetadataIdKey = "upstream_peer_id";
+constexpr std::string_view kUpstreamMetadataKey = "upstream_peer";
+constexpr std::string_view kDownstreamMetadataIdKey = "downstream_peer_id";
+constexpr std::string_view kDownstreamMetadataKey = "downstream_peer";
+
+// Sentinel key in the filter state, indicating that the peer metadata is
+// decidedly absent. This is different from a missing peer metadata ID key
+// which could indicate that the metadata is not received yet.
+const std::string kMetadataNotFoundValue = "envoy.wasm.metadata_exchange.peer_unknown";
+
 std::unique_ptr<::Envoy::Buffer::OwnedImpl>
 constructProxyHeaderData(const Envoy::ProtobufWkt::Any& proxy_data) {
   MetadataExchangeInitialHeader initial_header;
@@ -273,8 +284,8 @@ void MetadataExchangeFilter::tryReadProxyData(Buffer::Instance& data) {
   if (key_metadata_id_it != value_struct.fields().end()) {
     Envoy::ProtobufWkt::Value val = key_metadata_id_it->second;
     updatePeerId(config_->filter_direction_ == FilterDirection::Downstream
-                     ? ::Wasm::Common::kDownstreamMetadataIdKey
-                     : ::Wasm::Common::kUpstreamMetadataIdKey,
+                     ? kDownstreamMetadataIdKey
+                     : kUpstreamMetadataIdKey,
                  val.string_value());
   }
 }
@@ -286,12 +297,11 @@ void MetadataExchangeFilter::updatePeer(const std::string& fb) {
       MetadataExchangeConfig::nodeInfoPrototype());
   state->setValue(fb);
 
-  auto key = config_->filter_direction_ == FilterDirection::Downstream
-                 ? ::Wasm::Common::kDownstreamMetadataKey
-                 : ::Wasm::Common::kUpstreamMetadataKey;
+  auto key = config_->filter_direction_ == FilterDirection::Downstream ? kDownstreamMetadataKey
+                                                                       : kUpstreamMetadataKey;
   read_callbacks_->connection().streamInfo().filterState()->setData(
-      absl::StrCat("wasm.", key), std::move(state), StreamInfo::FilterState::StateType::Mutable,
-      StreamInfo::FilterState::LifeSpan::Connection);
+      absl::StrCat(kMetadataPrefix, key), std::move(state),
+      StreamInfo::FilterState::StateType::Mutable, StreamInfo::FilterState::LifeSpan::Connection);
 }
 
 void MetadataExchangeFilter::updatePeerId(absl::string_view key, absl::string_view value) {
@@ -301,8 +311,8 @@ void MetadataExchangeFilter::updatePeerId(absl::string_view key, absl::string_vi
   auto state = std::make_unique<::Envoy::Extensions::Filters::Common::Expr::CelState>(prototype);
   state->setValue(value);
   read_callbacks_->connection().streamInfo().filterState()->setData(
-      absl::StrCat("wasm.", key), std::move(state), StreamInfo::FilterState::StateType::Mutable,
-      prototype.life_span_);
+      absl::StrCat(kMetadataPrefix, key), std::move(state),
+      StreamInfo::FilterState::StateType::Mutable, prototype.life_span_);
 }
 
 void MetadataExchangeFilter::getMetadata(google::protobuf::Struct* metadata) {
@@ -324,14 +334,14 @@ void MetadataExchangeFilter::setMetadataNotFoundFilterState() {
     if (metadata_object) {
       updatePeer(Istio::Common::convertWorkloadMetadataToFlatNode(metadata_object.value()));
       updatePeerId(config_->filter_direction_ == FilterDirection::Downstream
-                       ? ::Wasm::Common::kDownstreamMetadataIdKey
-                       : ::Wasm::Common::kUpstreamMetadataIdKey,
+                       ? kDownstreamMetadataIdKey
+                       : kUpstreamMetadataIdKey,
                    "unknown");
       config_->stats().metadata_added_.inc();
       return;
     }
   }
-  updatePeerId(::Wasm::Common::kMetadataNotFoundValue, ::Wasm::Common::kMetadataNotFoundValue);
+  updatePeerId(kMetadataNotFoundValue, kMetadataNotFoundValue);
 }
 
 } // namespace MetadataExchange

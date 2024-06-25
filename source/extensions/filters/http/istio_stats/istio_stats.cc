@@ -70,7 +70,7 @@ absl::optional<absl::string_view> getNamespace(absl::string_view principal) {
 
 constexpr absl::string_view CustomStatNamespace = "istiocustom";
 
-absl::string_view extractString(const ProtobufWkt::Struct& metadata, const std::string& key) {
+absl::string_view extractString(const ProtobufWkt::Struct& metadata, absl::string_view key) {
   const auto& it = metadata.fields().find(key);
   if (it == metadata.fields().end()) {
     return {};
@@ -79,7 +79,7 @@ absl::string_view extractString(const ProtobufWkt::Struct& metadata, const std::
 }
 
 absl::string_view extractMapString(const ProtobufWkt::Struct& metadata, const std::string& map_key,
-                                   const std::string& key) {
+                                   absl::string_view key) {
   const auto& it = metadata.fields().find(map_key);
   if (it == metadata.fields().end()) {
     return {};
@@ -120,7 +120,8 @@ bool peerInfoRead(Reporter reporter, const StreamInfo::FilterState& filter_state
           ? "wasm.downstream_peer_id"
           : "wasm.upstream_peer_id";
   return filter_state.hasDataWithName(filter_state_key) ||
-         filter_state.hasDataWithName("envoy.wasm.metadata_exchange.peer_unknown");
+         filter_state.hasDataWithName(
+             "wasm.envoy.wasm.metadata_exchange.peer_unknown"); // kMetadataPrefix+kMetadataNotFoundValue
 }
 
 const Wasm::Common::FlatNode* peerInfo(Reporter reporter,
@@ -179,14 +180,15 @@ struct Context : public Singleton::Instance {
         workload_name_(pool_.add(extractString(node.metadata(), "WORKLOAD_NAME"))),
         namespace_(pool_.add(extractString(node.metadata(), "NAMESPACE"))),
         canonical_name_(pool_.add(
-            extractMapString(node.metadata(), "LABELS", "service.istio.io/canonical-name"))),
+            extractMapString(node.metadata(), "LABELS", Istio::Common::CanonicalNameLabel))),
         canonical_revision_(pool_.add(
-            extractMapString(node.metadata(), "LABELS", "service.istio.io/canonical-revision"))),
+            extractMapString(node.metadata(), "LABELS", Istio::Common::CanonicalRevisionLabel))),
         cluster_name_(pool_.add(extractString(node.metadata(), "CLUSTER_ID"))),
-        app_name_(pool_.add(extractMapString(node.metadata(), "LABELS", "app"))),
-        app_version_(pool_.add(extractMapString(node.metadata(), "LABELS", "version"))),
-        istio_build_(pool_.add("istio_build")), component_(pool_.add("component")),
-        proxy_(pool_.add("proxy")), tag_(pool_.add("tag")),
+        app_name_(pool_.add(extractMapString(node.metadata(), "LABELS", Istio::Common::AppLabel))),
+        app_version_(
+            pool_.add(extractMapString(node.metadata(), "LABELS", Istio::Common::VersionLabel))),
+        waypoint_(pool_.add("waypoint")), istio_build_(pool_.add("istio_build")),
+        component_(pool_.add("component")), proxy_(pool_.add("proxy")), tag_(pool_.add("tag")),
         istio_version_(pool_.add(extractString(node.metadata(), "ISTIO_VERSION"))) {
     all_metrics_ = {
         {"requests_total", requests_total_},
@@ -297,6 +299,7 @@ struct Context : public Singleton::Instance {
   const Stats::StatName cluster_name_;
   const Stats::StatName app_name_;
   const Stats::StatName app_version_;
+  const Stats::StatName waypoint_;
 
   // istio_build metric:
   // Publishes Istio version for the proxy as a gauge, sample data:
@@ -798,8 +801,10 @@ public:
     tags_.reserve(25);
     switch (config_->reporter()) {
     case Reporter::ServerSidecar:
-    case Reporter::ServerGateway:
       tags_.push_back({context_.reporter_, context_.destination_});
+      break;
+    case Reporter::ServerGateway:
+      tags_.push_back({context_.reporter_, context_.waypoint_});
       break;
     case Reporter::ClientSidecar:
       tags_.push_back({context_.reporter_, context_.source_});
@@ -1006,6 +1011,7 @@ private:
     // Compute destination service with client-side fallbacks.
     absl::string_view service_host;
     absl::string_view service_host_name;
+    absl::string_view service_namespace;
     if (!config_->disable_host_header_fallback_) {
       const auto* headers = info.getRequestHeaders();
       if (headers && headers->Host()) {
@@ -1022,6 +1028,7 @@ private:
       if (cluster_info && cluster_info.value()) {
         const auto& cluster_name = cluster_info.value()->name();
         if (cluster_name == "BlackHoleCluster" || cluster_name == "PassthroughCluster" ||
+            cluster_name == "InboundPassthroughCluster" ||
             cluster_name == "InboundPassthroughClusterIpv4" ||
             cluster_name == "InboundPassthroughClusterIpv6") {
           service_host_name = cluster_name;
@@ -1039,6 +1046,10 @@ private:
                   service_host = host_it->second.string_value();
                 }
                 const auto& name_it = service.find("name");
+                const auto& namespace_it = service.find("namespace");
+                if (namespace_it != service.end()) {
+                  service_namespace = namespace_it->second.string_value();
+                }
                 if (name_it != service.end()) {
                   service_host_name = name_it->second.string_value();
                 } else {
@@ -1139,12 +1150,20 @@ private:
         tags_.push_back(
             {context_.destination_workload_,
              endpoint_peer ? pool_.add(endpoint_peer->workload_name_) : context_.unknown_});
-        tags_.push_back({context_.destination_workload_namespace_, context_.namespace_});
+        tags_.push_back({context_.destination_workload_namespace_,
+                         endpoint_peer && !endpoint_peer->namespace_name_.empty()
+                             ? pool_.add(endpoint_peer->namespace_name_)
+                             : context_.unknown_});
         tags_.push_back({context_.destination_principal_,
-                         !local_san.empty() ? pool_.add(local_san) : context_.unknown_});
+                         endpoint_peer ? pool_.add(endpoint_peer->identity_) : context_.unknown_});
         // Endpoint encoding does not have app and version.
-        tags_.push_back({context_.destination_app_, context_.unknown_});
-        tags_.push_back({context_.destination_version_, context_.unknown_});
+        tags_.push_back(
+            {context_.destination_app_, endpoint_peer && !endpoint_peer->app_name_.empty()
+                                            ? pool_.add(endpoint_peer->app_name_)
+                                            : context_.unknown_});
+        tags_.push_back({context_.destination_version_, endpoint_peer
+                                                            ? pool_.add(endpoint_peer->app_version_)
+                                                            : context_.unknown_});
         auto canonical_name =
             endpoint_peer ? pool_.add(endpoint_peer->canonical_name_) : context_.unknown_;
         tags_.push_back({context_.destination_service_,
@@ -1215,8 +1234,11 @@ private:
       tags_.push_back({context_.destination_service_name_, service_host_name.empty()
                                                                ? context_.unknown_
                                                                : pool_.add(service_host_name)});
-      tags_.push_back({context_.destination_service_namespace_,
-                       !peer_namespace.empty() ? pool_.add(peer_namespace) : context_.unknown_});
+      tags_.push_back(
+          {context_.destination_service_namespace_,
+           !service_namespace.empty()
+               ? pool_.add(service_namespace)
+               : (!peer_namespace.empty() ? pool_.add(peer_namespace) : context_.unknown_)});
       tags_.push_back({context_.destination_cluster_, peer && !peer->cluster_name_.empty()
                                                           ? pool_.add(peer->cluster_name_)
                                                           : context_.unknown_});

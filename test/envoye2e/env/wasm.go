@@ -29,8 +29,6 @@ const SHA = "359dcd3a19f109c50e97517fe6b1e2676e870c4d"
 
 var Modules = []string{
 	"attributegen",
-	"metadata_exchange",
-	"stats",
 }
 
 // EnsureWasmFiles downloads wasm files for testing.
@@ -50,7 +48,7 @@ func EnsureWasmFiles(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		err = os.WriteFile(file, content, 0666)
+		err = os.WriteFile(file, content, 0o666)
 		if err != nil {
 			t.Fatal(err)
 		}

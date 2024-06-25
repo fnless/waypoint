@@ -17,23 +17,21 @@
 
 load(
     "@envoy//bazel:envoy_build_system.bzl",
-    "envoy_cc_extension",
+    "envoy_cc_library",
     "envoy_cc_test",
-    "envoy_extension_package",
 )
 
-envoy_extension_package()
+package(default_visibility = ["//visibility:public"])
 
 licenses(["notice"])
 
-envoy_cc_extension(
+envoy_cc_library(
     name = "filter_lib",
     srcs = ["filter.cc"],
     hdrs = ["filter.h"],
     repository = "@envoy",
     deps = [
         ":config_cc_proto",
-        "//extensions/common:context",
         "//extensions/common:metadata_object_lib",
         "//extensions/common:proto_util",
         "//source/extensions/common/workload_discovery:api_lib",
