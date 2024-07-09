@@ -62,17 +62,20 @@ ReadOrParseState KmeshTlvFilter::parseBuffer(Network::ListenerFilterBuffer& buff
     case TlvParseState::TypeAndLength:
       ENVOY_LOG(trace, "tlv parse state is TypeAndLength");
 
-      if (buf[index_] == TLV_TYPE_SERVICE) {
-        ENVOY_LOG(trace, "process TVL_TYPE_SERVICE");
+      if (buf[index_] == TLV_TYPE_SERVICE_ADDRESS) {
+        ENVOY_LOG(trace, "process TVL_TYPE_SERVICE_ADDRESS");
 
         uint32_t content_len = 0;
         std::memcpy(&content_len, buf + index_ + 1, TLV_LENGTH_LEN);
         content_len = ntohl(content_len);
         ENVOY_LOG(trace, "get tlv length {}", content_len);
 
-        if (content_len < TLV_TYPE_SERVICE_MIN_CONTENT_LEN) {
-          ENVOY_LOG(error, "the content length of tlv type service should be at least {}",
-                    TLV_TYPE_SERVICE_MIN_CONTENT_LEN);
+        if (content_len != TLV_TYPE_SERVICE_ADDRESS_IPV4_LEN &&
+            content_len != TLV_TYPE_SERVICE_ADDRESS_IPV6_LEN) {
+          ENVOY_LOG(error,
+                    "the content length of tlv type service address could only be {} for ipv4 "
+                    "address or {} for ipv6 address",
+                    TLV_TYPE_SERVICE_ADDRESS_IPV4_LEN, TLV_TYPE_SERVICE_ADDRESS_IPV6_LEN);
         }
 
         expected_length_ += content_len;
@@ -99,13 +102,23 @@ ReadOrParseState KmeshTlvFilter::parseBuffer(Network::ListenerFilterBuffer& buff
       sockaddr_storage addr;
       int len;
 
-      addr.ss_family = AF_INET;
-      len = sizeof(struct sockaddr_in);
-      auto in4 = reinterpret_cast<struct sockaddr_in*>(&addr);
-      std::memcpy(&in4->sin_addr, buf + index_, 4);
-      uint16_t port = 0;
-      std::memcpy(&port, buf + index_ + 4, 2);
-      in4->sin_port = port;
+      if (content_length_ == TLV_TYPE_SERVICE_ADDRESS_IPV4_LEN) {
+        addr.ss_family = AF_INET;
+        len = sizeof(struct sockaddr_in);
+        auto in4 = reinterpret_cast<struct sockaddr_in*>(&addr);
+        std::memcpy(&in4->sin_addr, buf + index_, 4);
+        uint16_t port = 0;
+        std::memcpy(&port, buf + index_ + 4, 2);
+        in4->sin_port = port;
+      } else {
+        addr.ss_family = AF_INET6;
+        len = sizeof(struct sockaddr_in6);
+        auto in6 = reinterpret_cast<struct sockaddr_in6*>(&addr);
+        std::memcpy(&in6->sin6_addr, buf + index_, 16);
+        uint16_t port = 0;
+        std::memcpy(&port, buf + index_ + 16, 2);
+        in6->sin6_port = port;
+      }
 
       std::string addrString =
           (*Envoy::Network::Address::addressFromSockAddr(addr, len, false))->asString();
