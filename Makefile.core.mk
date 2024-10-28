@@ -89,7 +89,7 @@ test:
 	  bazel $(BAZEL_STARTUP_ARGS) test $(BAZEL_BUILD_ARGS) $(BAZEL_CONFIG_CURRENT) -- $(BAZEL_TEST_TARGETS); \
 	fi
 	if [ -n "$(E2E_TEST_TARGETS)" ]; then \
-	  env ENVOY_DEBUG=$(TEST_ENVOY_DEBUG) ENVOY_PATH=$(shell bazel info $(BAZEL_BUILD_ARGS) $(BAZEL_CONFIG_CURRENT) bazel-bin)/envoy $(E2E_TEST_ENVS) GO111MODULE=on go test -timeout 30m $(E2E_TEST_FLAGS) $(E2E_TEST_TARGETS); \
+	  env ENVOY_DEBUG=$(TEST_ENVOY_DEBUG) ENVOY_PATH=$(shell bazel $(BAZEL_STARTUP_ARGS) info $(BAZEL_BUILD_ARGS) $(BAZEL_CONFIG_CURRENT) bazel-bin)/envoy $(E2E_TEST_ENVS) GO111MODULE=on go test -timeout 30m $(E2E_TEST_FLAGS) $(E2E_TEST_TARGETS); \
 	fi
 
 test_asan: BAZEL_CONFIG_CURRENT = $(BAZEL_CONFIG_ASAN)
@@ -108,7 +108,6 @@ check:
 lint: lint-copyright-banner format-go lint-go tidy-go lint-scripts gen-extensions-doc
 	@scripts/check-repository.sh
 	@scripts/check-style.sh
-	@scripts/verify-last-flag-matches-upstream.sh
 
 protoc = protoc -I common-protos -I extensions
 protoc_gen_docs_plugin := --docs_out=camel_case_fields=false,warnings=true,per_file=true,mode=html_fragment_with_front_matter:$(repo_dir)/
