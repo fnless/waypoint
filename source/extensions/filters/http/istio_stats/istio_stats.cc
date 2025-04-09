@@ -28,6 +28,7 @@
 #include "source/common/network/utility.h"
 #include "source/common/stream_info/utility.h"
 #include "source/extensions/filters/common/expr/context.h"
+#include "source/extensions/filters/common/expr/cel_state.h"
 #include "source/extensions/filters/common/expr/evaluator.h"
 #include "source/extensions/filters/http/common/pass_through_filter.h"
 #include "source/extensions/filters/http/grpc_stats/grpc_stats_filter.h"
@@ -122,13 +123,40 @@ bool peerInfoRead(Reporter reporter, const StreamInfo::FilterState& filter_state
          filter_state.hasDataWithName(Istio::Common::NoPeer);
 }
 
-const Istio::Common::WorkloadMetadataObject* peerInfo(Reporter reporter,
-                                                      const StreamInfo::FilterState& filter_state) {
+std::optional<Istio::Common::WorkloadMetadataObject>
+peerInfo(Reporter reporter, const StreamInfo::FilterState& filter_state) {
   const auto& filter_state_key =
       reporter == Reporter::ServerSidecar || reporter == Reporter::ServerGateway
           ? Istio::Common::DownstreamPeer
           : Istio::Common::UpstreamPeer;
-  return filter_state.getDataReadOnly<Istio::Common::WorkloadMetadataObject>(filter_state_key);
+  // This's a workaround before FilterStateObject support operation like `.labels['role']`.
+  // The workaround is to use CelState to store the peer metadata.
+  // Rebuild the WorkloadMetadataObject from the CelState.
+  const auto* cel_state =
+      filter_state.getDataReadOnly<Envoy::Extensions::Filters::Common::Expr::CelState>(
+          filter_state_key);
+  if (!cel_state) {
+    return {};
+  }
+
+  ProtobufWkt::Struct obj;
+  if (!obj.ParseFromString(absl::string_view(cel_state->value()))) {
+    return {};
+  }
+
+  Istio::Common::WorkloadMetadataObject peer_info(
+      extractString(obj, Istio::Common::InstanceNameToken),
+      extractString(obj, Istio::Common::ClusterNameToken),
+      extractString(obj, Istio::Common::NamespaceNameToken),
+      extractString(obj, Istio::Common::WorkloadNameToken),
+      extractString(obj, Istio::Common::ServiceNameToken),
+      extractString(obj, Istio::Common::ServiceVersionToken),
+      extractString(obj, Istio::Common::AppNameToken),
+      extractString(obj, Istio::Common::AppVersionToken),
+      Istio::Common::fromSuffix(extractString(obj, Istio::Common::WorkloadTypeToken)),
+      extractString(obj, Istio::Common::IdentityToken));
+
+  return peer_info;
 }
 
 // Process-wide context shared with all filter instances.
@@ -312,8 +340,6 @@ struct Context : public Singleton::Instance {
 using ContextSharedPtr = std::shared_ptr<Context>;
 
 SINGLETON_MANAGER_REGISTRATION(Context)
-
-using google::api::expr::runtime::CelValue;
 
 // Instructions on dropping, creating, and overriding labels.
 // This is not the "hot path" of the metrics system and thus, fairly
@@ -651,6 +677,13 @@ struct Config : public Logger::Loggable<Logger::Id::filter> {
           Protobuf::Arena arena;
           auto eval_status = compiled_exprs[id].first->Evaluate(*this, &arena);
           if (!eval_status.ok() || eval_status.value().IsError()) {
+            if (!eval_status.ok()) {
+              ENVOY_LOG(debug, "Failed to evaluate metric expression: {}", eval_status.status());
+            }
+            if (eval_status.value().IsError()) {
+              ENVOY_LOG(debug, "Failed to evaluate metric expression: {}",
+                        eval_status.value().ErrorOrDie()->message());
+            }
             expr_values_.push_back(std::make_pair(parent_.context_->unknown_, 0));
           } else {
             const auto string_value = Filters::Common::Expr::print(eval_status.value());
@@ -769,6 +802,7 @@ struct Config : public Logger::Loggable<Logger::Id::filter> {
 using ConfigSharedPtr = std::shared_ptr<Config>;
 
 class IstioStatsFilter : public Http::PassThroughFilter,
+                         public Logger::Loggable<Logger::Id::filter>,
                          public AccessLog::Instance,
                          public Network::ReadFilter,
                          public Network::ConnectionCallbacks {
@@ -895,6 +929,7 @@ private:
         const auto& info = decoder_callbacks_->streamInfo();
         peer_read_ = peerInfoRead(config_->reporter(), info.filterState());
         if (peer_read_ || end_stream) {
+          ENVOY_LOG(trace, "Populating peer metadata from HTTP MX.");
           populatePeerInfo(info, info.filterState());
         }
         if (is_grpc_ && (peer_read_ || end_stream)) {
@@ -933,6 +968,7 @@ private:
       peer_read_ = peerInfoRead(config_->reporter(), filter_state);
       // Report connection open once peer info is read or connection is closed.
       if (peer_read_ || end_stream) {
+        ENVOY_LOG(trace, "Populating peer metadata from TCP MX.");
         populatePeerInfo(info, filter_state);
         tags_.push_back({context_.request_protocol_, context_.tcp_});
         populateFlagsAndConnectionSecurity(info);
@@ -977,9 +1013,9 @@ private:
                         const StreamInfo::FilterState& filter_state) {
     // Compute peer info with client-side fallbacks.
     absl::optional<Istio::Common::WorkloadMetadataObject> peer;
-    const auto* object = peerInfo(config_->reporter(), filter_state);
+    auto object = peerInfo(config_->reporter(), filter_state);
     if (object) {
-      peer.emplace(*object);
+      peer.emplace(object.value());
     } else if (config_->reporter() == Reporter::ClientSidecar) {
       if (auto label_obj = extractEndpointMetadata(info); label_obj) {
         peer.emplace(label_obj.value());
@@ -1040,7 +1076,7 @@ private:
       }
     }
 
-    absl::string_view peer_san;
+    std::string peer_san;
     absl::string_view local_san;
     switch (config_->reporter()) {
     case Reporter::ServerSidecar:
@@ -1071,9 +1107,19 @@ private:
     case Reporter::ClientSidecar: {
       const Ssl::ConnectionInfoConstSharedPtr ssl_info =
           info.upstreamInfo() ? info.upstreamInfo()->upstreamSslConnection() : nullptr;
+      std::optional<Istio::Common::WorkloadMetadataObject> endpoint_peer;
       if (ssl_info && !ssl_info->uriSanPeerCertificate().empty()) {
         peer_san = ssl_info->uriSanPeerCertificate()[0];
       }
+      if (peer_san.empty()) {
+        auto endpoint_object = peerInfo(config_->reporter(), filter_state);
+        if (endpoint_object) {
+          endpoint_peer.emplace(endpoint_object.value());
+          peer_san = endpoint_peer->identity_;
+        }
+      }
+      // This won't work for sidecar/ingress -> ambient becuase of the CONNECT
+      // tunnel.
       if (ssl_info && !ssl_info->uriSanLocalCertificate().empty()) {
         local_san = ssl_info->uriSanLocalCertificate()[0];
       }
@@ -1121,38 +1167,51 @@ private:
       switch (config_->reporter()) {
       case Reporter::ServerGateway: {
         std::optional<Istio::Common::WorkloadMetadataObject> endpoint_peer;
-        const auto* endpoint_object = peerInfo(Reporter::ClientSidecar, filter_state);
+        auto endpoint_object = peerInfo(Reporter::ClientSidecar, filter_state);
         if (endpoint_object) {
-          endpoint_peer.emplace(*endpoint_object);
+          endpoint_peer.emplace(endpoint_object.value());
         }
         tags_.push_back(
-            {context_.destination_workload_,
-             endpoint_peer ? pool_.add(endpoint_peer->workload_name_) : context_.unknown_});
+            {context_.destination_workload_, endpoint_peer && !endpoint_peer->workload_name_.empty()
+                                                 ? pool_.add(endpoint_peer->workload_name_)
+                                                 : context_.unknown_});
         tags_.push_back({context_.destination_workload_namespace_,
                          endpoint_peer && !endpoint_peer->namespace_name_.empty()
                              ? pool_.add(endpoint_peer->namespace_name_)
                              : context_.unknown_});
-        tags_.push_back({context_.destination_principal_,
-                         endpoint_peer ? pool_.add(endpoint_peer->identity_) : context_.unknown_});
+        tags_.push_back(
+            {context_.destination_principal_, endpoint_peer && !endpoint_peer->identity_.empty()
+                                                  ? pool_.add(endpoint_peer->identity_)
+                                                  : context_.unknown_});
         // Endpoint encoding does not have app and version.
         tags_.push_back(
             {context_.destination_app_, endpoint_peer && !endpoint_peer->app_name_.empty()
                                             ? pool_.add(endpoint_peer->app_name_)
                                             : context_.unknown_});
-        tags_.push_back({context_.destination_version_, endpoint_peer
-                                                            ? pool_.add(endpoint_peer->app_version_)
-                                                            : context_.unknown_});
-        auto canonical_name =
-            endpoint_peer ? pool_.add(endpoint_peer->canonical_name_) : context_.unknown_;
-        tags_.push_back({context_.destination_service_,
-                         service_host.empty() ? canonical_name : pool_.add(service_host)});
-        tags_.push_back({context_.destination_canonical_service_, canonical_name});
         tags_.push_back(
-            {context_.destination_canonical_revision_,
-             endpoint_peer ? pool_.add(endpoint_peer->canonical_revision_) : context_.unknown_});
+            {context_.destination_version_, endpoint_peer && !endpoint_peer->app_version_.empty()
+                                                ? pool_.add(endpoint_peer->app_version_)
+                                                : context_.unknown_});
+        tags_.push_back({context_.destination_service_,
+                         service_host.empty() ? context_.unknown_ : pool_.add(service_host)});
+        tags_.push_back({context_.destination_canonical_service_,
+                         endpoint_peer && !endpoint_peer->canonical_name_.empty()
+                             ? pool_.add(endpoint_peer->canonical_name_)
+                             : context_.unknown_});
+        tags_.push_back({context_.destination_canonical_revision_,
+                         endpoint_peer && !endpoint_peer->canonical_revision_.empty()
+                             ? pool_.add(endpoint_peer->canonical_revision_)
+                             : context_.unknown_});
         tags_.push_back({context_.destination_service_name_, service_host_name.empty()
-                                                                 ? canonical_name
+                                                                 ? context_.unknown_
                                                                  : pool_.add(service_host_name)});
+        tags_.push_back({context_.destination_service_namespace_, !service_namespace.empty()
+                                                                      ? pool_.add(service_namespace)
+                                                                      : context_.unknown_});
+        tags_.push_back(
+            {context_.destination_cluster_, endpoint_peer && !endpoint_peer->cluster_name_.empty()
+                                                ? pool_.add(endpoint_peer->cluster_name_)
+                                                : context_.unknown_});
         break;
       }
       default:
@@ -1170,10 +1229,10 @@ private:
         tags_.push_back({context_.destination_service_name_, service_host_name.empty()
                                                                  ? context_.canonical_name_
                                                                  : pool_.add(service_host_name)});
+        tags_.push_back({context_.destination_service_namespace_, context_.namespace_});
+        tags_.push_back({context_.destination_cluster_, context_.cluster_name_});
         break;
       }
-      tags_.push_back({context_.destination_service_namespace_, context_.namespace_});
-      tags_.push_back({context_.destination_cluster_, context_.cluster_name_});
 
       break;
     }
