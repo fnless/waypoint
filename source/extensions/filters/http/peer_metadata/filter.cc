@@ -29,6 +29,8 @@ namespace Extensions {
 namespace HttpFilters {
 namespace PeerMetadata {
 
+using ::Envoy::Extensions::Filters::Common::Expr::CelState;
+
 class XDSMethod : public DiscoveryMethod {
 public:
   XDSMethod(bool downstream, Server::Configuration::ServerFactoryContext& factory_context)
@@ -78,11 +80,17 @@ absl::optional<PeerInfo> XDSMethod::derivePeerInfo(const StreamInfo::StreamInfo&
       }
     }
   }
+  if (!peer_address) {
+    return {};
+  }
+  ENVOY_LOG_MISC(debug, "Peer address: {}", peer_address->asString());
   return metadata_provider_->GetMetadata(peer_address);
 }
 
-MXMethod::MXMethod(bool downstream, Server::Configuration::ServerFactoryContext& factory_context)
-    : downstream_(downstream), tls_(factory_context.threadLocal()) {
+MXMethod::MXMethod(bool downstream, const absl::flat_hash_set<std::string> additional_labels,
+                   Server::Configuration::ServerFactoryContext& factory_context)
+    : downstream_(downstream), tls_(factory_context.threadLocal()),
+      additional_labels_(additional_labels) {
   tls_.set([](Event::Dispatcher&) { return std::make_shared<MXCache>(); });
 }
 
@@ -126,7 +134,7 @@ absl::optional<PeerInfo> MXMethod::lookup(absl::string_view id, absl::string_vie
   if (!metadata.ParseFromString(bytes)) {
     return {};
   }
-  const auto out = Istio::Common::convertStructToWorkloadMetadata(metadata);
+  auto out = Istio::Common::convertStructToWorkloadMetadata(metadata, additional_labels_);
   if (max_peer_cache_size_ > 0 && !id.empty()) {
     // do not let the cache grow beyond max cache size.
     if (static_cast<uint32_t>(cache.size()) > max_peer_cache_size_) {
@@ -139,15 +147,17 @@ absl::optional<PeerInfo> MXMethod::lookup(absl::string_view id, absl::string_vie
 
 MXPropagationMethod::MXPropagationMethod(
     bool downstream, Server::Configuration::ServerFactoryContext& factory_context,
+    const absl::flat_hash_set<std::string>& additional_labels,
     const io::istio::http::peer_metadata::Config_IstioHeaders& istio_headers)
     : downstream_(downstream), id_(factory_context.localInfo().node().id()),
-      value_(computeValue(factory_context)),
+      value_(computeValue(additional_labels, factory_context)),
       skip_external_clusters_(istio_headers.skip_external_clusters()) {}
 
 std::string MXPropagationMethod::computeValue(
+    const absl::flat_hash_set<std::string>& additional_labels,
     Server::Configuration::ServerFactoryContext& factory_context) const {
-  const auto obj =
-      Istio::Common::convertStructToWorkloadMetadata(factory_context.localInfo().node().metadata());
+  const auto obj = Istio::Common::convertStructToWorkloadMetadata(
+      factory_context.localInfo().node().metadata(), additional_labels);
   const google::protobuf::Struct metadata = Istio::Common::convertWorkloadMetadataToStruct(*obj);
   const std::string metadata_bytes = Istio::Common::serializeToStringDeterministic(metadata);
   return Base64::encode(metadata_bytes.data(), metadata_bytes.size());
@@ -155,10 +165,8 @@ std::string MXPropagationMethod::computeValue(
 
 void MXPropagationMethod::inject(const StreamInfo::StreamInfo& info, Http::HeaderMap& headers,
                                  Context& ctx) const {
-  if (skip_external_clusters_) {
-    if (skipMXHeaders(info)) {
-      return;
-    }
+  if (skipMXHeaders(skip_external_clusters_, info)) {
+    return;
   }
   if (!downstream_ || ctx.request_peer_id_received_) {
     headers.setReference(Headers::get().ExchangeMetadataHeaderId, id_);
@@ -171,19 +179,24 @@ void MXPropagationMethod::inject(const StreamInfo::StreamInfo& info, Http::Heade
 FilterConfig::FilterConfig(const io::istio::http::peer_metadata::Config& config,
                            Server::Configuration::FactoryContext& factory_context)
     : shared_with_upstream_(config.shared_with_upstream()),
-      downstream_discovery_(
-          buildDiscoveryMethods(config.downstream_discovery(), true, factory_context)),
-      upstream_discovery_(
-          buildDiscoveryMethods(config.upstream_discovery(), false, factory_context)),
-      downstream_propagation_(
-          buildPropagationMethods(config.downstream_propagation(), true, factory_context)),
-      upstream_propagation_(
-          buildPropagationMethods(config.upstream_propagation(), false, factory_context)) {}
+      downstream_discovery_(buildDiscoveryMethods(config.downstream_discovery(),
+                                                  buildAdditionalLabels(config.additional_labels()),
+                                                  true, factory_context)),
+      upstream_discovery_(buildDiscoveryMethods(config.upstream_discovery(),
+                                                buildAdditionalLabels(config.additional_labels()),
+                                                false, factory_context)),
+      downstream_propagation_(buildPropagationMethods(
+          config.downstream_propagation(), buildAdditionalLabels(config.additional_labels()), true,
+          factory_context)),
+      upstream_propagation_(buildPropagationMethods(
+          config.upstream_propagation(), buildAdditionalLabels(config.additional_labels()), false,
+          factory_context)) {}
 
 std::vector<DiscoveryMethodPtr> FilterConfig::buildDiscoveryMethods(
     const Protobuf::RepeatedPtrField<io::istio::http::peer_metadata::Config::DiscoveryMethod>&
         config,
-    bool downstream, Server::Configuration::FactoryContext& factory_context) const {
+    const absl::flat_hash_set<std::string>& additional_labels, bool downstream,
+    Server::Configuration::FactoryContext& factory_context) const {
   std::vector<DiscoveryMethodPtr> methods;
   methods.reserve(config.size());
   for (const auto& method : config) {
@@ -195,8 +208,8 @@ std::vector<DiscoveryMethodPtr> FilterConfig::buildDiscoveryMethods(
       break;
     case io::istio::http::peer_metadata::Config::DiscoveryMethod::MethodSpecifierCase::
         kIstioHeaders:
-      methods.push_back(
-          std::make_unique<MXMethod>(downstream, factory_context.serverFactoryContext()));
+      methods.push_back(std::make_unique<MXMethod>(downstream, additional_labels,
+                                                   factory_context.serverFactoryContext()));
       break;
     default:
       break;
@@ -208,21 +221,32 @@ std::vector<DiscoveryMethodPtr> FilterConfig::buildDiscoveryMethods(
 std::vector<PropagationMethodPtr> FilterConfig::buildPropagationMethods(
     const Protobuf::RepeatedPtrField<io::istio::http::peer_metadata::Config::PropagationMethod>&
         config,
-    bool downstream, Server::Configuration::FactoryContext& factory_context) const {
+    const absl::flat_hash_set<std::string>& additional_labels, bool downstream,
+    Server::Configuration::FactoryContext& factory_context) const {
   std::vector<PropagationMethodPtr> methods;
   methods.reserve(config.size());
   for (const auto& method : config) {
     switch (method.method_specifier_case()) {
     case io::istio::http::peer_metadata::Config::PropagationMethod::MethodSpecifierCase::
         kIstioHeaders:
-      methods.push_back(std::make_unique<MXPropagationMethod>(
-          downstream, factory_context.serverFactoryContext(), method.istio_headers()));
+      methods.push_back(
+          std::make_unique<MXPropagationMethod>(downstream, factory_context.serverFactoryContext(),
+                                                additional_labels, method.istio_headers()));
       break;
     default:
       break;
     }
   }
   return methods;
+}
+
+absl::flat_hash_set<std::string>
+FilterConfig::buildAdditionalLabels(const Protobuf::RepeatedPtrField<std::string>& labels) const {
+  absl::flat_hash_set<std::string> result;
+  for (const auto& label : labels) {
+    result.emplace(label);
+  }
+  return result;
 }
 
 void FilterConfig::discoverDownstream(StreamInfo::StreamInfo& info, Http::RequestHeaderMap& headers,
@@ -268,8 +292,12 @@ void FilterConfig::setFilterState(StreamInfo::StreamInfo& info, bool downstream,
   const absl::string_view key =
       downstream ? Istio::Common::DownstreamPeer : Istio::Common::UpstreamPeer;
   if (!info.filterState()->hasDataWithName(key)) {
+    // Use CelState to allow operation filter_state.upstream_peer.labels['role']
+    auto pb = value.serializeAsProto();
+    auto peer_info = std::make_unique<CelState>(FilterConfig::peerInfoPrototype());
+    peer_info->setValue(absl::string_view(pb->SerializeAsString()));
     info.filterState()->setData(
-        key, std::make_shared<PeerInfo>(value), StreamInfo::FilterState::StateType::Mutable,
+        key, std::move(peer_info), StreamInfo::FilterState::StateType::Mutable,
         StreamInfo::FilterState::LifeSpan::FilterChain, sharedWithUpstream());
   } else {
     ENVOY_LOG(debug, "Duplicate peer metadata, skipping");
@@ -282,19 +310,34 @@ Http::FilterHeadersStatus Filter::decodeHeaders(Http::RequestHeaderMap& headers,
   return Http::FilterHeadersStatus::Continue;
 }
 
-bool MXPropagationMethod::skipMXHeaders(const StreamInfo::StreamInfo& info) const {
+bool MXPropagationMethod::skipMXHeaders(const bool skip_external_clusters,
+                                        const StreamInfo::StreamInfo& info) const {
+  // We skip metadata in two cases.
+  // 1. skip_external_clusters is enabled, and we detect the upstream as external.
   const auto& cluster_info = info.upstreamClusterInfo();
   if (cluster_info && cluster_info.value()) {
     const auto& cluster_name = cluster_info.value()->name();
-    if (cluster_name == "PassthroughCluster") {
+    // PassthroughCluster is always considered external
+    if (skip_external_clusters && cluster_name == "PassthroughCluster") {
       return true;
     }
     const auto& filter_metadata = cluster_info.value()->metadata().filter_metadata();
     const auto& it = filter_metadata.find("istio");
+    // Otherwise, cluster must be tagged as external
     if (it != filter_metadata.end()) {
-      const auto& skip_mx = it->second.fields().find("external");
+      if (skip_external_clusters) {
+        const auto& skip_mx = it->second.fields().find("external");
+        if (skip_mx != it->second.fields().end()) {
+          if (skip_mx->second.bool_value()) {
+            return true;
+          }
+        }
+      }
+      const auto& skip_mx = it->second.fields().find("disable_mx");
       if (skip_mx != it->second.fields().end()) {
-        return skip_mx->second.bool_value();
+        if (skip_mx->second.bool_value()) {
+          return true;
+        }
       }
     }
   }
