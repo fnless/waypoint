@@ -31,6 +31,7 @@ config_setting(
 )
 
 ISTIO_EXTENSIONS = [
+    "//source/extensions/common/cluster_fallback:config",
     "//source/extensions/common/workload_discovery:api_lib",  # Experimental: WIP
     "//source/extensions/filters/http/alpn:config_lib",
     "//source/extensions/filters/http/istio_stats",
