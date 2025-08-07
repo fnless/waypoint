@@ -498,6 +498,12 @@ ENVOY_CONTRIB_EXTENSIONS = {
     #
 
     "envoy.network.connection_balance.dlb":                     "//contrib/dlb/source:connection_balancer",
+
+    #
+    # Custom cluster plugins
+    #
+
+    "envoy.router.cluster_specifier_plugin.cluster_fallback":   "//contrib/custom_cluster_plugins/cluster_fallback/source:config",
 }
 
 
@@ -513,6 +519,7 @@ ISTIO_ENABLED_CONTRIB_EXTENSIONS = [
     "envoy.filters.network.postgres_proxy",
     "envoy.filters.network.sip_proxy",
     "envoy.filters.sip.router",
+    "envoy.router.cluster_specifier_plugin.cluster_fallback",
     "envoy.tls.key_providers.cryptomb",
     "envoy.tls.key_providers.qat",
     "envoy.network.connection_balance.dlb",
